@@ -1,0 +1,22 @@
+[project]
+name = "docx-shrinker"
+version = "0.1.0"
+description = "Shrink and sanitize Word (.docx) documents by converting Visio embeddings, compressing images, and stripping metadata"
+authors = [{name = "cognitohazard"}]
+license = {text = "MIT"}
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pywin32",
+    "pymupdf",
+]
+
+[project.scripts]
+docx-shrinker = "docx_shrinker.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/docx_shrinker"]
