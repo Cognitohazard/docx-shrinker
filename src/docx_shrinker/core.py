@@ -24,9 +24,12 @@ def extract_vml_dimensions(obj_xml):
     width_emu = 3048000   # fallback 3.2 inches
     height_emu = 2286000  # fallback 2.4 inches
 
+    _num = r'(\d+(?:\.\d*)?|\.\d+)'  # valid float: 1, 1.5, 1., .5
+    _w_pat = r'width:' + _num + r'(pt|in)'
+    _h_pat = r'height:' + _num + r'(pt|in)'
     for style in styles:
-        w_m = re.search(r'width:([\d.]+)(pt|in)', style)
-        h_m = re.search(r'height:([\d.]+)(pt|in)', style)
+        w_m = re.search(_w_pat, style)
+        h_m = re.search(_h_pat, style)
         if w_m and h_m:
             w_val = float(w_m.group(1))
             h_val = float(h_m.group(1))
@@ -85,7 +88,7 @@ def ensure_namespaces(doc_xml):
         return doc_xml
     tag = m.group(1)
     for attr, uri in ns.items():
-        if attr not in tag:
+        if attr + '="' not in tag:
             tag += f' {attr}="{uri}"'
     return doc_xml[:m.start()] + tag + m.group(2) + doc_xml[m.end():]
 
@@ -381,10 +384,17 @@ def remove_comment_files(unpack_dir):
 
 def strip_comment_refs(doc):
     """Strip comment range/reference tags from document XML string."""
-    doc = re.sub(r'<w:commentRangeStart\b[^>]*/>', '', doc)
-    doc = re.sub(r'<w:commentRangeEnd\b[^>]*/>', '', doc)
-    doc = re.sub(r'<w:commentReference\b[^>]*/>', '', doc)
-    return doc
+    return re.sub(r'<w:(?:commentRangeStart|commentRangeEnd|commentReference)\b[^>]*/>', '', doc)
+
+
+def _strip_nested_tag(doc, tag, replacement):
+    """Remove or unwrap all instances of a potentially nested XML tag.
+    Processes innermost matches first to handle nesting correctly."""
+    pattern = rf'<{tag}\b[^>]*>((?:(?!</?{tag}\b).)*?)</{tag}>'
+    while True:
+        doc, n = re.subn(pattern, replacement, doc, flags=re.DOTALL)
+        if n == 0:
+            return doc
 
 
 def strip_revisions(doc, warnings):
@@ -399,13 +409,12 @@ def strip_revisions(doc, warnings):
             balanced = False
 
     if balanced:
-        doc = re.sub(r'<w:del\b[^>]*>.*?</w:del>', '', doc, flags=re.DOTALL)
-        doc = re.sub(r'<w:ins\b[^>]*>(.*?)</w:ins>', r'\1', doc, flags=re.DOTALL)
+        doc = _strip_nested_tag(doc, 'w:del', '')
+        doc = _strip_nested_tag(doc, 'w:ins', r'\1')
 
     # Always safe to strip property-change blocks and rsid attributes
-    for tag in ['rPrChange', 'pPrChange', 'sectPrChange', 'tblPrChange',
-                'tblGridChange', 'tcPrChange', 'trPrChange']:
-        doc = re.sub(rf'<w:{tag}\b[^>]*>.*?</w:{tag}>', '', doc, flags=re.DOTALL)
+    _pr_tags = 'rPrChange|pPrChange|sectPrChange|tblPrChange|tblGridChange|tcPrChange|trPrChange'
+    doc = re.sub(rf'<w:(?:{_pr_tags})\b[^>]*>.*?</w:(?:{_pr_tags})>', '', doc, flags=re.DOTALL)
     doc = re.sub(r'\s+w:rsid\w*="[^"]*"', '', doc)
     return doc
 
