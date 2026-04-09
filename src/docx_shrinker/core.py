@@ -235,7 +235,7 @@ def strip_bookmarks(doc):
 def _render_pdf_to_image(pdf_path, img_path, fmt='jpg', dpi=300, quality=95,
                          max_width=0):
     """Render the first page of a PDF to an image file via PyMuPDF.
-    Insets by 1pt to crop the Visio page frame border.
+    Insets by 0.5pt to crop the Visio page frame border.
     Returns True on success."""
     import fitz
 
@@ -243,8 +243,8 @@ def _render_pdf_to_image(pdf_path, img_path, fmt='jpg', dpi=300, quality=95,
     page = pdf_doc[0]
     scale = dpi / 72
 
-    # Crop border: inset by ~1pt (the Visio page frame)
-    inset = 1.0  # points
+    # Crop border: inset by 0.5pt (the Visio page frame hairline)
+    inset = 0.5  # points
     rect = page.rect
     clip = fitz.Rect(rect.x0 + inset, rect.y0 + inset,
                      rect.x1 - inset, rect.y1 - inset)
