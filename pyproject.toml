@@ -1,6 +1,6 @@
 [project]
 name = "docx-shrinker"
-version = "0.1.0"
+version = "0.1.1"
 description = "Shrink and sanitize Word (.docx) documents by converting Visio embeddings, compressing images, and stripping metadata"
 authors = [{name = "cognitohazard"}]
 license = {text = "MIT"}
