@@ -13,6 +13,21 @@ except PackageNotFoundError:
     from . import __version__
 
 
+_TAG_LABELS = {
+    'dc:creator': 'Author',
+    'cp:lastModifiedBy': 'Last modified by',
+    'cp:lastPrinted': 'Last printed',
+    'cp:revision': 'Revision',
+    'dc:subject': 'Subject',
+    'cp:keywords': 'Keywords',
+    'cp:category': 'Category',
+    'cp:contentStatus': 'Content status',
+    'Company': 'Company',
+    'Manager': 'Manager',
+    'HyperlinkBase': 'Hyperlink base',
+}
+
+
 def _print_result(result):
     """Print a clean summary of what was done."""
     lines = []
@@ -30,10 +45,30 @@ def _print_result(result):
     # Deduplication
     if result['duplicates_removed']:
         lines.append(f'  Deduplicated:       {result["duplicates_removed"]} file(s)')
+    personal = result.get('personal_info_stripped', {})
+    if personal:
+        for tag, value in personal.items():
+            label = _TAG_LABELS.get(tag, tag)
+            # Truncate long values
+            display = value if len(value) <= 60 else value[:57] + '...'
+            lines.append(f'  Stripped:           {label}: {display}')
+    else:
+        lines.append(f'  Personal info:      (none found)')
 
-    # Metadata & markup
-    lines.append(f'  Personal info:      stripped')
-    lines.append(f'  Tracked changes:    accepted/stripped')
+    # Tracked changes
+    revisions = result.get('revisions_stripped', {})
+    rev_parts = []
+    if revisions.get('deletions'):
+        rev_parts.append(f'{revisions["deletions"]} deletion(s)')
+    if revisions.get('insertions'):
+        rev_parts.append(f'{revisions["insertions"]} insertion(s)')
+    if revisions.get('property_changes'):
+        rev_parts.append(f'{revisions["property_changes"]} property change(s)')
+    if rev_parts:
+        lines.append(f'  Tracked changes:    {", ".join(rev_parts)} accepted')
+    else:
+        lines.append(f'  Tracked changes:    (none found)')
+
     if result['comments_removed']:
         lines.append(f'  Comments:           {result["comments_removed"]} file(s) removed')
     if result['bookmarks_removed']:
