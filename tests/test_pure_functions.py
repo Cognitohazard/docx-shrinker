@@ -13,6 +13,8 @@ from docx_shrinker.core import (
     strip_bookmarks,
     strip_comment_refs,
     strip_revisions,
+    _find_page_border,
+    _border_clip_rect,
 )
 
 
@@ -251,32 +253,39 @@ class TestStripCommentRefs:
 class TestStripRevisions:
     def test_simple_del_removed(self):
         doc = 'before<w:del w:id="1"><w:r><w:t>gone</w:t></w:r></w:del>after'
-        assert strip_revisions(doc, []) == "beforeafter"
+        result, counts = strip_revisions(doc, [])
+        assert result == "beforeafter"
+        assert counts['deletions'] == 1
 
     def test_simple_ins_unwrapped_content_kept(self):
         doc = 'before<w:ins w:id="1"><w:r><w:t>kept</w:t></w:r></w:ins>after'
-        result = strip_revisions(doc, [])
+        result, counts = strip_revisions(doc, [])
         assert result == "before<w:r><w:t>kept</w:t></w:r>after"
+        assert counts['insertions'] == 1
 
     def test_unbalanced_del_warns_and_preserves(self):
         doc = '<w:del w:id="1"><w:r>text</w:r>'
         warnings = []
-        result = strip_revisions(doc, warnings)
+        result, counts = strip_revisions(doc, warnings)
         assert any("Mismatched w:del" in w for w in warnings)
         assert "<w:del" in result  # preserved to avoid content loss
 
     def test_rsid_attributes_stripped(self):
         doc = '<w:r w:rsidR="00A1234" w:rsidRPr="00B5678"><w:t>text</w:t></w:r>'
-        assert strip_revisions(doc, []) == "<w:r><w:t>text</w:t></w:r>"
+        result, _ = strip_revisions(doc, [])
+        assert result == "<w:r><w:t>text</w:t></w:r>"
 
     def test_rpr_change_stripped(self):
         doc = '<w:rPr><w:rPrChange w:id="1"><w:rPr><w:b/></w:rPr></w:rPrChange></w:rPr>'
-        assert strip_revisions(doc, []) == "<w:rPr></w:rPr>"
+        result, counts = strip_revisions(doc, [])
+        assert result == "<w:rPr></w:rPr>"
+        assert counts['property_changes'] == 1
 
     def test_del_wrapping_ins_removes_everything(self):
         """When a deletion wraps an insertion, all content should be removed."""
         doc = 'before<w:del w:id="1"><w:ins w:id="2"><w:r>text</w:r></w:ins></w:del>after'
-        assert strip_revisions(doc, []) == "beforeafter"
+        result, _ = strip_revisions(doc, [])
+        assert result == "beforeafter"
 
     # --- Nesting bugs (the reason for the iterative-innermost-first fix) ---
 
@@ -294,7 +303,7 @@ class TestStripRevisions:
             '</w:del>'
             'after'
         )
-        result = strip_revisions(doc, [])
+        result, _ = strip_revisions(doc, [])
         assert result == "beforeafter"
 
     def test_nested_ins_fully_unwrapped(self):
@@ -310,7 +319,7 @@ class TestStripRevisions:
             '</w:ins>'
             'after'
         )
-        result = strip_revisions(doc, [])
+        result, _ = strip_revisions(doc, [])
         assert "<w:ins" not in result
         assert "</w:ins>" not in result
         expected_content = (
@@ -330,4 +339,62 @@ class TestStripRevisions:
             '</w:del>'
             '</w:del>'
         )
-        assert strip_revisions(doc, []) == ""
+        result, _ = strip_revisions(doc, [])
+        assert result == ""
+
+
+# ---------------------------------------------------------------------------
+# _find_page_border / _border_clip_rect
+# ---------------------------------------------------------------------------
+
+def _make_pdf_page_with_border(width=100, height=100, stroke_width=0.5):
+    """Helper: create a single-page PDF with a stroked rectangle at the edges."""
+    import fitz
+    doc = fitz.open()
+    page = doc.new_page(width=width, height=height)
+    shape = page.new_shape()
+    shape.draw_rect(page.rect)
+    shape.finish(color=(0, 0, 0), width=stroke_width)
+    shape.commit()
+    return page, doc
+
+
+class TestBorderClipRect:
+    def test_no_drawings_returns_full_rect(self):
+        """A blank page should return the full page rect."""
+        import fitz
+        doc = fitz.open()
+        page = doc.new_page(width=100, height=100)
+        clip = _border_clip_rect(page)
+        assert clip == page.rect
+        doc.close()
+
+    def test_detects_border_and_clips(self):
+        """A stroked rectangle at page edges should produce a smaller clip."""
+        page, doc = _make_pdf_page_with_border(stroke_width=0.75)
+        clip = _border_clip_rect(page)
+        assert clip.x0 > page.rect.x0
+        assert clip.y0 > page.rect.y0
+        assert clip.x1 < page.rect.x1
+        assert clip.y1 < page.rect.y1
+        doc.close()
+
+    def test_thick_stroke_ignored(self):
+        """Strokes wider than 2pt are not page frame borders."""
+        page, doc = _make_pdf_page_with_border(stroke_width=3.0)
+        clip = _border_clip_rect(page)
+        assert clip == page.rect
+        doc.close()
+
+    def test_interior_rect_ignored(self):
+        """A rectangle not at the page edges should not be detected."""
+        import fitz
+        doc = fitz.open()
+        page = doc.new_page(width=100, height=100)
+        shape = page.new_shape()
+        shape.draw_rect(fitz.Rect(10, 10, 90, 90))
+        shape.finish(color=(0, 0, 0), width=0.5)
+        shape.commit()
+        clip = _border_clip_rect(page)
+        assert clip == page.rect
+        doc.close()

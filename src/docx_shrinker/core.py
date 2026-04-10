@@ -235,10 +235,198 @@ def strip_bookmarks(doc):
     return doc, len(to_remove)
 
 
+def _find_page_border(page):
+    """Find the Visio page frame border drawing, if present.
+
+    Visio exports a thin (<=2pt) black stroked rectangle at the page edges.
+    Returns the drawing dict, or None if not found.
+    """
+    rect = page.rect
+
+    def _is_border(d):
+        if d.get("color") is None:
+            return False
+        width = d.get("width", 0)
+        if width <= 0 or width > 2:
+            return False
+        drect = d.get("rect")
+        if drect is None:
+            return False
+        return (abs(drect.x0 - rect.x0) < 1 and
+                abs(drect.y0 - rect.y0) < 1 and
+                abs(drect.x1 - rect.x1) < 1 and
+                abs(drect.y1 - rect.y1) < 1)
+
+    drawings = page.get_drawings()
+    # Border is typically the first drawing; check it before scanning all
+    if drawings and _is_border(drawings[0]):
+        return drawings[0]
+    for d in drawings[1:]:
+        if _is_border(d):
+            return d
+    return None
+
+
+def _border_clip_rect(page):
+    """Compute a clip rect that excludes the Visio page frame border.
+
+    The border is a stroked rectangle not centered on the page edge —
+    left/top are nearly flush while bottom/right overshoot outward.
+    We compute the visible inward extent per side and clip just past it.
+
+    Returns the clip Rect, or page.rect if no border is found.
+    """
+    import fitz
+    border = _find_page_border(page)
+    if border is None:
+        return page.rect
+    stroke_w = border.get("width", 0.75)
+    half_w = stroke_w / 2
+    drect = border["rect"]
+    rect = page.rect
+    aa_margin = 0.25  # clip past anti-alias fringe
+
+    # Visible inward extent per side = half stroke width minus outward overshoot
+    inset_top = max(half_w - (rect.y0 - drect.y0), 0) + aa_margin
+    inset_bottom = max(half_w - (drect.y1 - rect.y1), 0) + aa_margin
+    inset_left = max(half_w - (rect.x0 - drect.x0), 0) + aa_margin
+    inset_right = max(half_w - (drect.x1 - rect.x1), 0) + aa_margin
+
+    return fitz.Rect(rect.x0 + inset_left, rect.y0 + inset_top,
+                     rect.x1 - inset_right, rect.y1 - inset_bottom)
+
+
+def _extract_vsdx_images(vsdx_path):
+    """Extract raster images from a .vsdx ZIP.
+
+    Returns list of (media_name, ext, data) for images > 5KB.
+    """
+    images = []
+    with zipfile.ZipFile(vsdx_path) as zf:
+        for name in zf.namelist():
+            if 'media' not in name.lower():
+                continue
+            ext = name.rsplit('.', 1)[-1].lower()
+            if ext not in ('png', 'bmp', 'jpeg', 'jpg'):
+                continue
+            info = zf.getinfo(name)
+            if info.file_size <= 5000:
+                continue
+            images.append((name, ext, zf.read(name)))
+    return images
+
+
+def _flip_pixmap_vertical(pix):
+    """Return a new vertically-flipped copy of a PyMuPDF Pixmap."""
+    import fitz
+    w, h, n = pix.width, pix.height, pix.n
+    stride = w * n
+    flipped = fitz.Pixmap(pix.colorspace, fitz.IRect(0, 0, w, h), pix.alpha)
+    src, dst = pix.samples_mv, flipped.samples_mv
+    for y in range(h):
+        dst[(h - 1 - y) * stride:(h - y) * stride] = src[y * stride:(y + 1) * stride]
+    return flipped
+
+
+def _restore_pdf_images(pdf_path, vsdx_path, tmp_dir):
+    """Replace Visio-degraded images in a PDF with originals from the vsdx.
+
+    Visio downscales and JPEG-compresses raster images during PDF export.
+    This extracts the originals from the vsdx ZIP, matches them to PDF
+    images by aspect ratio, flips if the PDF transform has negative Y scale,
+    and replaces them.  Saves the fixed PDF back to pdf_path.
+    """
+    import fitz
+
+    raw_originals = _extract_vsdx_images(vsdx_path)
+    if not raw_originals:
+        return
+
+    # Pre-decode originals once (avoids repeated decompression in the match loop)
+    originals = []
+    for media_name, ext, data in raw_originals:
+        try:
+            pix = fitz.Pixmap(data)
+        except Exception:
+            continue
+        if pix.width > 0 and pix.height > 0:
+            originals.append((media_name, pix, pix.width / pix.height))
+    if not originals:
+        return
+
+    pdf_doc = fitz.open(pdf_path)
+    page = pdf_doc[0]
+    pdf_images = page.get_images(full=True)
+    if not pdf_images:
+        pdf_doc.close()
+        return
+
+    replaced = False
+    for img_info in pdf_images:
+        xref = img_info[0]
+        ex = pdf_doc.extract_image(xref)
+        pdf_w, pdf_h = ex['width'], ex['height']
+        if pdf_w == 0 or pdf_h == 0:
+            continue
+        pdf_ar = pdf_w / pdf_h
+
+        # Match by aspect ratio
+        best_match = None
+        best_diff = 0.05
+        for media_name, orig_pix, orig_ar in originals:
+            diff = abs(pdf_ar - orig_ar)
+            if diff < best_diff:
+                best_diff = diff
+                best_match = (media_name, orig_pix)
+
+        if best_match is None:
+            continue
+
+        media_name, orig_pix = best_match
+
+        # Prepare RGB pixmap (no alpha)
+        if orig_pix.alpha:
+            orig_pix = fitz.Pixmap(fitz.csRGB, orig_pix)
+
+        # Check transform: negative Y scale means image is flipped in PDF
+        transforms = page.get_image_rects(xref, transform=True)
+        needs_flip = False
+        if transforms:
+            matrix = transforms[0][1]  # (rect, matrix)
+            if matrix.d < 0:  # negative Y scale
+                needs_flip = True
+
+        if needs_flip:
+            orig_pix = _flip_pixmap_vertical(orig_pix)
+
+        # Save to temp file for replace_image
+        tmp_path = os.path.join(tmp_dir, f'_replace_{xref}.png')
+        orig_pix.save(tmp_path)
+        try:
+            page.replace_image(xref, filename=tmp_path)
+            replaced = True
+        except Exception:
+            pass
+        finally:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+    if replaced:
+        # Save and reopen to ensure changes take effect
+        tmp_pdf = pdf_path + '.tmp'
+        pdf_doc.save(tmp_pdf)
+        pdf_doc.close()
+        os.replace(tmp_pdf, pdf_path)
+    else:
+        pdf_doc.close()
+
+
 def _render_pdf_to_image(pdf_path, img_path, fmt='jpg', dpi=300, quality=95,
                          max_width=0):
     """Render the first page of a PDF to an image file via PyMuPDF.
-    Insets by 0.5pt to crop the Visio page frame border.
+    Clips out the Visio page frame border before rasterizing.
     Returns True on success."""
     import fitz
 
@@ -246,11 +434,7 @@ def _render_pdf_to_image(pdf_path, img_path, fmt='jpg', dpi=300, quality=95,
     page = pdf_doc[0]
     scale = dpi / 72
 
-    # Crop border: inset by 0.5pt (the Visio page frame hairline)
-    inset = 0.5  # points
-    rect = page.rect
-    clip = fitz.Rect(rect.x0 + inset, rect.y0 + inset,
-                     rect.x1 - inset, rect.y1 - inset)
+    clip = _border_clip_rect(page)
 
     # Cap scale so output width doesn't exceed max_width
     if max_width > 0:
@@ -316,6 +500,7 @@ def convert_vsdx_via_visio(vsdx_paths, out_dir, warnings, fmt='jpg', dpi=300,
                 _export_vsdx_to_pdf(visio, vsdx_path, pdf_path)
 
                 if os.path.exists(pdf_path):
+                    _restore_pdf_images(pdf_path, vsdx_path, out_dir)
                     _render_pdf_to_image(pdf_path, img_path, fmt=fmt,
                                          dpi=dpi, quality=quality,
                                          max_width=max_width)
@@ -346,29 +531,44 @@ def convert_vsdx_via_visio(vsdx_paths, out_dir, warnings, fmt='jpg', dpi=300,
 
 
 def _strip_xml_tags(path, tags):
-    """Remove specified XML tags from a file."""
+    """Remove specified XML tags from a file.
+
+    Returns a dict {tag: value} for tags that were found and removed.
+    """
     if not os.path.exists(path):
-        return
+        return {}
     with open(path, 'r', encoding='utf-8') as f:
         xml = f.read()
+    found = {}
     for tag in tags:
-        xml = re.sub(rf'<{re.escape(tag)}[^>]*>.*?</{re.escape(tag)}>', '', xml, flags=re.DOTALL)
+        pattern = rf'<{re.escape(tag)}[^>]*>(.*?)</{re.escape(tag)}>'
+        def _capture(m, _tag=tag):
+            found[_tag] = m.group(1).strip()
+            return ''
+        xml = re.sub(pattern, _capture, xml, count=1, flags=re.DOTALL)
     with open(path, 'w', encoding='utf-8') as f:
         f.write(xml)
+    return found
 
 
 def sanitize_core_props(unpack_dir):
-    """Strip personal info from docProps/core.xml."""
-    _strip_xml_tags(os.path.join(unpack_dir, 'docProps', 'core.xml'),
-                    ['dc:creator', 'cp:lastModifiedBy', 'cp:lastPrinted',
-                     'cp:revision', 'dc:subject', 'cp:keywords',
-                     'cp:category', 'cp:contentStatus'])
+    """Strip personal info from docProps/core.xml.
+
+    Returns dict of stripped fields {tag: value}.
+    """
+    return _strip_xml_tags(os.path.join(unpack_dir, 'docProps', 'core.xml'),
+                           ['dc:creator', 'cp:lastModifiedBy', 'cp:lastPrinted',
+                            'cp:revision', 'dc:subject', 'cp:keywords',
+                            'cp:category', 'cp:contentStatus'])
 
 
 def sanitize_app_props(unpack_dir):
-    """Strip sensitive fields from docProps/app.xml."""
-    _strip_xml_tags(os.path.join(unpack_dir, 'docProps', 'app.xml'),
-                    ['Company', 'Manager', 'HyperlinkBase'])
+    """Strip sensitive fields from docProps/app.xml.
+
+    Returns dict of stripped fields {tag: value}.
+    """
+    return _strip_xml_tags(os.path.join(unpack_dir, 'docProps', 'app.xml'),
+                           ['Company', 'Manager', 'HyperlinkBase'])
 
 
 def remove_comment_files(unpack_dir):
@@ -398,7 +598,12 @@ def _strip_nested_tag(doc, tag, replacement):
 
 
 def strip_revisions(doc, warnings):
-    """Accept all tracked changes by stripping revision markup from document XML string."""
+    """Accept all tracked changes by stripping revision markup from document XML string.
+
+    Returns (doc, counts) where counts is a dict with keys 'deletions', 'insertions',
+    'property_changes' indicating how many of each were stripped.
+    """
+    counts = {'deletions': 0, 'insertions': 0, 'property_changes': 0}
     balanced = True
     for tag in ['w:del', 'w:ins']:
         opens = len(re.findall(rf'<{tag}\b', doc))
@@ -409,14 +614,18 @@ def strip_revisions(doc, warnings):
             balanced = False
 
     if balanced:
+        counts['deletions'] = len(re.findall(r'<w:del\b', doc))
+        counts['insertions'] = len(re.findall(r'<w:ins\b', doc))
         doc = _strip_nested_tag(doc, 'w:del', '')
         doc = _strip_nested_tag(doc, 'w:ins', r'\1')
 
     # Always safe to strip property-change blocks and rsid attributes
     _pr_tags = 'rPrChange|pPrChange|sectPrChange|tblPrChange|tblGridChange|tcPrChange|trPrChange'
+    pr_matches = re.findall(rf'<w:(?:{_pr_tags})\b', doc)
+    counts['property_changes'] = len(pr_matches)
     doc = re.sub(rf'<w:(?:{_pr_tags})\b[^>]*>.*?</w:(?:{_pr_tags})>', '', doc, flags=re.DOTALL)
     doc = re.sub(r'\s+w:rsid\w*="[^"]*"', '', doc)
-    return doc
+    return doc, counts
 
 
 def remove_garbage_parts(unpack_dir):
@@ -732,7 +941,8 @@ def shrink_docx(src_path, dst_path, fmt='jpg', dpi=300, quality=95, max_width=20
 
         # --- 2b. Strip comments, revisions, bookmarks from document XML (in-memory) ---
         doc = strip_comment_refs(doc)
-        doc = strip_revisions(doc, warnings)
+        doc, revision_counts = strip_revisions(doc, warnings)
+        result['revisions_stripped'] = revision_counts
         doc, bm_removed = strip_bookmarks(doc)
         result['bookmarks_removed'] = bm_removed
 
@@ -787,8 +997,9 @@ def shrink_docx(src_path, dst_path, fmt='jpg', dpi=300, quality=95, max_width=20
         result['duplicates_removed'] = dedup_media(media_dir, unpack_dir)
 
         # --- 7. Remove personal info and sensitive data ---
-        sanitize_core_props(unpack_dir)
-        sanitize_app_props(unpack_dir)
+        stripped_core = sanitize_core_props(unpack_dir)
+        stripped_app = sanitize_app_props(unpack_dir)
+        result['personal_info_stripped'] = {**stripped_core, **stripped_app}
 
         result['comments_removed'] = remove_comment_files(unpack_dir)
 
