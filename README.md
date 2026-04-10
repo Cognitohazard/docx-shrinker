@@ -116,6 +116,67 @@ A `.docx` file is a ZIP archive containing XML and media files. docx-shrinker ex
 
 Visio diagrams embedded as OLE objects include both the full `.vsdx` source and a low-resolution EMF preview image. docx-shrinker replaces these with a high-quality raster render and strips the heavy `.vsdx` originals — often the single biggest source of bloat.
 
+## Technical reference
+
+### Processing pipeline
+
+`shrink_docx()` unpacks the `.docx` ZIP into a temp directory, applies all transformations in-place, then repacks into a new ZIP. The original file is never modified.
+
+#### 1. Visio conversion (`.vsdx` → PDF → image)
+
+Embedded Visio diagrams are OLE objects containing both the full `.vsdx` source and a low-resolution EMF preview. The conversion pipeline:
+
+1. **`_export_vsdx_to_pdf`** — Opens each `.vsdx` via Visio COM (`ExportAsFixedFormat`) and exports to PDF. This two-step path exists because Visio's direct raster export (`Page.Export` to PNG/BMP) produces extremely low-quality output. The PDF intermediate preserves full vector fidelity.
+
+2. **`_restore_pdf_images`** — Visio's PDF export **downscales and JPEG-compresses** any raster images embedded in `.vsdx` files, even if the originals are lossless PNGs (e.g., a 1590x633 PNG becomes a 668x266 JPEG with visible chroma artifacts). There is no COM setting to control this. The fix: extract the original images from the `.vsdx` ZIP, match them to degraded PDF images by aspect ratio, and replace them with `page.replace_image()`. The corrected PDF is saved and reopened before rasterization. A critical detail: the PDF image transform matrix often has a **negative Y scale** (`matrix.d < 0`, since PDF origin is bottom-left), meaning the image data is stored vertically flipped. When replacing, the original must be flipped to match. Not all images need flipping — some transforms have positive Y scale.
+
+3. **`_border_clip_rect`** — Visio always draws a 0.75pt black stroked rectangle at the page edges of every exported PDF. This border is **not centered** on the page boundary — left/top are nearly flush while bottom/right overshoot outward by 0.02–0.12pt. The code detects this rectangle via `page.get_drawings()` (typically drawing #0), computes per-side inset from the actual stroke overshoot, and clips the render rect inward to exclude both the stroke and its anti-alias fringe.
+
+   Earlier approaches that failed:
+   - **Fixed uniform inset** (0.5pt or 1pt) — either clipped content or left borders on some sides due to the asymmetric overshoot.
+   - **Pixel-level detection** after rasterization — fragile; anti-aliased gray pixels don't pass a simple threshold, and results varied per image.
+   - **White rectangle overlay** — the overlay's own edges get anti-aliased, replacing one faint border with another.
+
+4. **`_render_pdf_to_image`** — Rasterizes the first page of the corrected PDF to PNG/JPG via PyMuPDF, using the computed clip rect. Respects DPI, quality, and max-width settings.
+
+#### 2. OLE/VML to DrawingML conversion
+
+- **`extract_vml_dimensions`** — Parses width/height in EMU from `<w:object>` style attributes (handles both `pt` and `in` units).
+- **`object_to_drawing`** — Rewrites legacy VML `<w:object>` blocks as modern DrawingML `<w:drawing>` inline pictures, preserving the image relationship ID and dimensions.
+- **`next_doc_pr_id`** — Scans the document XML for the highest existing `docPr`/`cNvPr` id to generate unique IDs for new drawing elements.
+- **`ensure_namespaces`** — Adds `wp:` and `r:` namespace declarations to the root `<w:document>` if missing, which is required for DrawingML elements.
+
+#### 3. Image compression
+
+- **`compress_media_images`** — Re-encodes oversized raster images in `word/media/`. PNGs with high estimated compression potential are converted to JPEG. Existing JPEGs are re-saved at the target quality. Images exceeding `max_width` are downscaled. Skips images that would grow larger after re-encoding.
+
+#### 4. Media deduplication
+
+- **`dedup_media`** — Identifies identical files in `word/media/` by MD5 hash. Keeps one canonical copy and rewrites all `.rels` references to point to it, removing the duplicates.
+
+#### 5. Metadata and markup stripping
+
+- **`sanitize_core_props`** / **`sanitize_app_props`** — Strip personal info (author, last modified by, company, manager, keywords, etc.) from `docProps/core.xml` and `docProps/app.xml`.
+- **`remove_comment_files`** — Deletes `comments.xml`, `commentsExtended.xml`, and `commentsIds.xml`.
+- **`strip_comment_refs`** — Removes comment range/reference XML tags (`commentRangeStart`, `commentRangeEnd`, `commentReference`) from document XML.
+- **`strip_revisions`** — Accepts all tracked changes inline: unwraps `<w:ins>` content, removes `<w:del>` blocks and their content, strips revision property tags (`rPrChange`, `pPrChange`, `sectPrChange`, `tblPrChange`).
+- **`strip_bookmarks`** — Removes auto-generated bookmarks (`_GoBack`, empty-name).
+
+#### 6. Garbage part removal
+
+- **`remove_garbage_parts`** — Deletes thumbnail, VBA macros (`vbaProject.bin`, `vbaData.xml`), printer settings, ActiveX controls, custom XML data, and the `.vsdx` embeddings themselves (after conversion).
+
+#### 7. Cleanup and validation
+
+- **`clean_content_types`** — Removes `[Content_Types].xml` entries referencing deleted parts.
+- **`clean_relationships`** — Removes `.rels` entries referencing deleted parts across all relationship files.
+- **`_strip_xml_tags`** / **`_strip_nested_tag`** — Low-level helpers for removing XML tags, handling arbitrarily nested structures by processing innermost matches first.
+- Output ZIP integrity is validated (well-formed ZIP, `[Content_Types].xml` present) before finalizing.
+
+#### 8. Interactive mode
+
+- **`_interactive_reconvert`** — When `-i` is passed, presents the top 5 largest converted images and offers to re-convert selected ones at a different quality/DPI setting.
+
 ## License
 
 MIT
