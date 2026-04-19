@@ -55,9 +55,9 @@ docx-shrinker report.docx output.docx
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--format {jpg,png}` | `jpg` | Image format for converted Visio figures |
-| `--dpi N` | `300` | Rasterization DPI for Visio conversion |
+| `--dpi N` | `300` | Effective rasterization DPI. Every figure renders at this DPI unless the result would exceed `--max-megapixels`. |
 | `--quality N` | `95` | JPG quality (1–100). Ignored for PNG. |
-| `--max-width N` | `2000` | Max pixel width for raster images. `0` to disable. |
+| `--max-megapixels N` | `100` | Cap on output pixel count per image, in megapixels. Images exceeding the cap are downscaled, preserving aspect ratio. `0` to disable. |
 | `-i, --interactive` | off | After conversion, show top 5 largest images and offer to re-convert at different quality |
 | `--version` | | Show version and exit |
 
@@ -69,10 +69,10 @@ Convert Visio figures to PNG at 150 DPI:
 docx-shrinker report.docx --format png --dpi 150
 ```
 
-Aggressive compression (lower quality, smaller max width):
+Aggressive compression (lower quality, tighter megapixel cap):
 
 ```
-docx-shrinker report.docx --quality 80 --max-width 1200
+docx-shrinker report.docx --quality 80 --max-megapixels 25
 ```
 
 Interactive mode to fine-tune large images:
@@ -137,7 +137,7 @@ Embedded Visio diagrams are OLE objects containing both the full `.vsdx` source 
    - **Pixel-level detection** after rasterization — fragile; anti-aliased gray pixels don't pass a simple threshold, and results varied per image.
    - **White rectangle overlay** — the overlay's own edges get anti-aliased, replacing one faint border with another.
 
-4. **`_render_pdf_to_image`** — Rasterizes the first page of the corrected PDF to PNG/JPG via PyMuPDF, using the computed clip rect. Respects DPI, quality, and max-width settings.
+4. **`_render_pdf_to_image`** — Rasterizes the first page of the corrected PDF to PNG/JPG via PyMuPDF, using the computed clip rect. Renders at the requested effective DPI and downscales only if the result would exceed `max_megapixels`, so small and large Visio pages get the same quality.
 
 #### 2. OLE/VML to DrawingML conversion
 
@@ -148,7 +148,7 @@ Embedded Visio diagrams are OLE objects containing both the full `.vsdx` source 
 
 #### 3. Image compression
 
-- **`compress_media_images`** — Re-encodes oversized raster images in `word/media/`. PNGs with high estimated compression potential are converted to JPEG. Existing JPEGs are re-saved at the target quality. Images exceeding `max_width` are downscaled. Skips images that would grow larger after re-encoding.
+- **`compress_media_images`** — Re-encodes oversized raster images in `word/media/`. PNGs with high estimated compression potential are converted to JPEG. Existing JPEGs are re-saved at the target quality. Images whose pixel count exceeds `max_megapixels` are downscaled. Skips images that would grow larger after re-encoding.
 
 #### 4. Media deduplication
 

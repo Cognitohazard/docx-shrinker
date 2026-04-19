@@ -1,11 +1,52 @@
 """Core functionality for shrinking and sanitizing Word (.docx) documents."""
 
 import hashlib
-import zipfile
 import os
 import re
 import shutil
 import tempfile
+import zipfile
+from typing import Any, Literal, TypedDict
+
+ImageFormat = Literal['jpg', 'png']
+
+import fitz
+
+
+class RevisionCounts(TypedDict):
+    deletions: int
+    insertions: int
+    property_changes: int
+
+
+class ShrinkResult(TypedDict):
+    original_size_mb: float
+    new_size_mb: float
+    reduction_mb: float
+    reduction_percent: float
+    output_path: str
+    visio_converted: list[tuple[str, int]]
+    visio_removed: int
+    images_compressed: list[tuple[str, int, int]]
+    duplicates_removed: int
+    comments_removed: int
+    bookmarks_removed: int
+    garbage_removed: list[str]
+    warnings: list[str]
+    revisions_stripped: RevisionCounts
+    personal_info_stripped: dict[str, str]
+
+
+def _downscale_factor(total_px: float, cap_megapixels: int) -> float:
+    """Scale factor to cap a pixmap/render at cap_megapixels, preserving aspect.
+    Returns 1.0 when no downscale is needed or cap is disabled (cap<=0)."""
+    if cap_megapixels <= 0:
+        return 1.0
+    cap_px = cap_megapixels * 1_000_000
+    if total_px <= cap_px:
+        return 1.0
+    return (cap_px / total_px) ** 0.5
+
 
 # Patterns for parts removed during cleanup (used in content types and rels)
 _CLEANUP_PATTERNS = [
@@ -16,7 +57,7 @@ _CLEANUP_PATTERNS = [
 ]
 
 
-def extract_vml_dimensions(obj_xml):
+def extract_vml_dimensions(obj_xml: str) -> tuple[int, int]:
     """Extract width/height in EMU from a VML <w:object> block.
     Searches all style attributes for one containing both 'width:' and 'height:'
     (skipping unrelated styles like 'miter' on stroke elements)."""
@@ -40,7 +81,7 @@ def extract_vml_dimensions(obj_xml):
     return width_emu, height_emu
 
 
-def object_to_drawing(obj_xml, doc_pr_id):
+def object_to_drawing(obj_xml: str, doc_pr_id: int) -> str:
     """Convert a VML <w:object> block to a DrawingML <w:drawing> block.
     doc_pr_id must be unique across the document."""
     img_match = re.search(r'<v:imagedata\s[^>]*r:id="(rId\d+)"', obj_xml)
@@ -70,13 +111,13 @@ def object_to_drawing(obj_xml, doc_pr_id):
     )
 
 
-def next_doc_pr_id(doc_xml):
+def next_doc_pr_id(doc_xml: str) -> int:
     """Find the highest existing docPr/cNvPr id in the document and return max + 1."""
     ids = (int(m) for m in re.findall(r'(?:docPr|cNvPr)\b[^>]*\bid="(\d+)"', doc_xml))
     return max(ids, default=0) + 1
 
 
-def ensure_namespaces(doc_xml):
+def ensure_namespaces(doc_xml: str) -> str:
     """Ensure the root <w:document> element declares wp: and r: namespaces
     needed by generated DrawingML blocks."""
     ns = {
@@ -93,13 +134,18 @@ def ensure_namespaces(doc_xml):
     return doc_xml[:m.start()] + tag + m.group(2) + doc_xml[m.end():]
 
 
-def compress_media_images(media_dir, max_width=2000, quality=85, skip_files=None):
+def compress_media_images(
+    media_dir: str,
+    max_megapixels: int = 100,
+    quality: int = 85,
+    skip_files: set[str] | None = None,
+) -> list[tuple[str, int, int]]:
     """Re-encode oversized raster images in word/media/ to reduce file size.
-    Resizes images wider than max_width and re-compresses JPGs.
+    Downscales images whose pixel count exceeds max_megapixels and re-compresses
+    JPGs. `max_megapixels=0` disables the downscale (JPG recompression still
+    runs).
     skip_files: set of filenames to skip (e.g. freshly converted Visio images).
     Returns list of (filename, old_kb, new_kb) for images that were shrunk."""
-    import fitz
-
     results = []
     if not os.path.isdir(media_dir):
         return results
@@ -123,19 +169,12 @@ def compress_media_images(media_dir, max_width=2000, quality=85, skip_files=None
         if pix.alpha:
             pix = fitz.Pixmap(fitz.csRGB, pix)
 
-        resized = False
-        if pix.width > max_width:
-            scale = max_width / pix.width
-            new_w = max_width
-            new_h = int(pix.height * scale)
-            # Resize via PDF re-render
-            tmp_pdf = fitz.open()
-            page = tmp_pdf.new_page(width=pix.width, height=pix.height)
-            page.insert_image(page.rect, pixmap=pix)
-            mat = fitz.Matrix(new_w / pix.width, new_h / pix.height)
-            pix = tmp_pdf[0].get_pixmap(matrix=mat, alpha=False)
-            tmp_pdf.close()
-            resized = True
+        scale = _downscale_factor(pix.width * pix.height, max_megapixels)
+        resized = scale < 1.0
+        if resized:
+            new_w = max(1, int(pix.width * scale))
+            new_h = max(1, int(pix.height * scale))
+            pix = fitz.Pixmap(pix, new_w, new_h)
 
         # Re-compress: save to temp first, only overwrite if actually smaller
         if ext in ('.jpg', '.jpeg'):
@@ -161,7 +200,7 @@ def compress_media_images(media_dir, max_width=2000, quality=85, skip_files=None
     return results
 
 
-def dedup_media(media_dir, unpack_dir):
+def dedup_media(media_dir: str, unpack_dir: str) -> int:
     """Deduplicate identical files in word/media/ by hash.
     Rewrites all .rels files to point duplicates to a single canonical file.
     Returns number of duplicates removed."""
@@ -216,7 +255,7 @@ def dedup_media(media_dir, unpack_dir):
     return removed
 
 
-def strip_bookmarks(doc):
+def strip_bookmarks(doc: str) -> tuple[str, int]:
     """Strip auto-generated bookmarks (_GoBack, empty name) from document XML string.
     Returns (modified_doc, count)."""
     to_remove = []
@@ -235,7 +274,7 @@ def strip_bookmarks(doc):
     return doc, len(to_remove)
 
 
-def _find_page_border(page):
+def _find_page_border(page: fitz.Page) -> dict | None:
     """Find the Visio page frame border drawing, if present.
 
     Visio exports a thin (<=2pt) black stroked rectangle at the page edges.
@@ -267,7 +306,7 @@ def _find_page_border(page):
     return None
 
 
-def _border_clip_rect(page):
+def _border_clip_rect(page: fitz.Page) -> fitz.Rect:
     """Compute a clip rect that excludes the Visio page frame border.
 
     The border is a stroked rectangle not centered on the page edge —
@@ -276,7 +315,6 @@ def _border_clip_rect(page):
 
     Returns the clip Rect, or page.rect if no border is found.
     """
-    import fitz
     border = _find_page_border(page)
     if border is None:
         return page.rect
@@ -296,7 +334,7 @@ def _border_clip_rect(page):
                      rect.x1 - inset_right, rect.y1 - inset_bottom)
 
 
-def _extract_vsdx_images(vsdx_path):
+def _extract_vsdx_images(vsdx_path: str) -> list[tuple[str, bytes]]:
     """Extract raster images from a .vsdx ZIP.
 
     Returns list of (media_name, ext, data) for images > 5KB.
@@ -316,9 +354,8 @@ def _extract_vsdx_images(vsdx_path):
     return images
 
 
-def _flip_pixmap_vertical(pix):
+def _flip_pixmap_vertical(pix: fitz.Pixmap) -> fitz.Pixmap:
     """Return a new vertically-flipped copy of a PyMuPDF Pixmap."""
-    import fitz
     w, h, n = pix.width, pix.height, pix.n
     stride = w * n
     flipped = fitz.Pixmap(pix.colorspace, fitz.IRect(0, 0, w, h), pix.alpha)
@@ -328,7 +365,7 @@ def _flip_pixmap_vertical(pix):
     return flipped
 
 
-def _restore_pdf_images(pdf_path, vsdx_path, tmp_dir):
+def _restore_pdf_images(pdf_path: str, vsdx_path: str, tmp_dir: str) -> None:
     """Replace Visio-degraded images in a PDF with originals from the vsdx.
 
     Visio downscales and JPEG-compresses raster images during PDF export.
@@ -336,8 +373,6 @@ def _restore_pdf_images(pdf_path, vsdx_path, tmp_dir):
     images by aspect ratio, flips if the PDF transform has negative Y scale,
     and replaces them.  Saves the fixed PDF back to pdf_path.
     """
-    import fitz
-
     raw_originals = _extract_vsdx_images(vsdx_path)
     if not raw_originals:
         return
@@ -423,25 +458,33 @@ def _restore_pdf_images(pdf_path, vsdx_path, tmp_dir):
         pdf_doc.close()
 
 
-def _render_pdf_to_image(pdf_path, img_path, fmt='jpg', dpi=300, quality=95,
-                         max_width=0):
+def _render_pdf_to_image(
+    pdf_path: str,
+    img_path: str,
+    fmt: ImageFormat = 'jpg',
+    dpi: int = 300,
+    quality: int = 95,
+    max_megapixels: int = 100,
+) -> bool:
     """Render the first page of a PDF to an image file via PyMuPDF.
     Clips out the Visio page frame border before rasterizing.
-    Returns True on success."""
-    import fitz
 
+    `dpi` is the effective render DPI. The output is downscaled only if it
+    would exceed `max_megapixels` pixels; otherwise every page renders at the
+    requested DPI regardless of physical page size. `max_megapixels=0` disables
+    the cap.
+
+    Returns True on success."""
     pdf_doc = fitz.open(pdf_path)
     page = pdf_doc[0]
     scale = dpi / 72
 
     clip = _border_clip_rect(page)
 
-    # Cap scale so output width doesn't exceed max_width
-    if max_width > 0:
-        content_width_pt = clip.x1 - clip.x0
-        full_width_px = content_width_pt * scale
-        if full_width_px > max_width:
-            scale = max_width / content_width_pt
+    content_w_pt = clip.x1 - clip.x0
+    content_h_pt = clip.y1 - clip.y0
+    total_px = content_w_pt * content_h_pt * scale * scale
+    scale *= _downscale_factor(total_px, max_megapixels)
 
     mat = fitz.Matrix(scale, scale)
     pix = page.get_pixmap(matrix=mat, alpha=False, clip=clip)
@@ -457,14 +500,14 @@ def _render_pdf_to_image(pdf_path, img_path, fmt='jpg', dpi=300, quality=95,
 _VISIO_OPEN_FLAGS = 0x8 | 0x2  # visOpenDontList | visOpenRO
 
 
-def _export_vsdx_to_pdf(visio, vsdx_path, pdf_path):
+def _export_vsdx_to_pdf(visio: Any, vsdx_path: str, pdf_path: str) -> None:
     """Export a single .vsdx to PDF using an already-running Visio instance."""
     doc = visio.Documents.OpenEx(os.path.abspath(vsdx_path), _VISIO_OPEN_FLAGS)
     doc.ExportAsFixedFormat(1, os.path.abspath(pdf_path), 1, 0)  # PDF, Print, All
     doc.Close()
 
 
-def _get_visio(warnings):
+def _get_visio(warnings: list[str]) -> Any | None:
     """Launch Visio COM and return the application object, or None."""
     try:
         import win32com.client
@@ -481,8 +524,16 @@ def _get_visio(warnings):
     return visio
 
 
-def convert_vsdx_via_visio(vsdx_paths, out_dir, warnings, fmt='jpg', dpi=300,
-                           quality=95, max_width=2000, keep_pdfs=False):
+def convert_vsdx_via_visio(
+    vsdx_paths: list[str],
+    out_dir: str,
+    warnings: list[str],
+    fmt: ImageFormat = 'jpg',
+    dpi: int = 300,
+    quality: int = 95,
+    max_megapixels: int = 100,
+    keep_pdfs: bool = False,
+) -> dict[str, str]:
     """Convert .vsdx files via Visio COM (vsdx->PDF) then PyMuPDF (PDF->image).
 
     Returns dict: {vsdx_path: image_path} for successful conversions."""
@@ -503,7 +554,7 @@ def convert_vsdx_via_visio(vsdx_paths, out_dir, warnings, fmt='jpg', dpi=300,
                     _restore_pdf_images(pdf_path, vsdx_path, out_dir)
                     _render_pdf_to_image(pdf_path, img_path, fmt=fmt,
                                          dpi=dpi, quality=quality,
-                                         max_width=max_width)
+                                         max_megapixels=max_megapixels)
 
                     if not keep_pdfs:
                         try:
@@ -530,7 +581,7 @@ def convert_vsdx_via_visio(vsdx_paths, out_dir, warnings, fmt='jpg', dpi=300,
     return results
 
 
-def _strip_xml_tags(path, tags):
+def _strip_xml_tags(path: str, tags: list[str]) -> dict[str, str]:
     """Remove specified XML tags from a file.
 
     Returns a dict {tag: value} for tags that were found and removed.
@@ -551,7 +602,7 @@ def _strip_xml_tags(path, tags):
     return found
 
 
-def sanitize_core_props(unpack_dir):
+def sanitize_core_props(unpack_dir: str) -> dict[str, str]:
     """Strip personal info from docProps/core.xml.
 
     Returns dict of stripped fields {tag: value}.
@@ -562,7 +613,7 @@ def sanitize_core_props(unpack_dir):
                             'cp:category', 'cp:contentStatus'])
 
 
-def sanitize_app_props(unpack_dir):
+def sanitize_app_props(unpack_dir: str) -> dict[str, str]:
     """Strip sensitive fields from docProps/app.xml.
 
     Returns dict of stripped fields {tag: value}.
@@ -571,7 +622,7 @@ def sanitize_app_props(unpack_dir):
                            ['Company', 'Manager', 'HyperlinkBase'])
 
 
-def remove_comment_files(unpack_dir):
+def remove_comment_files(unpack_dir: str) -> int:
     """Remove comments.xml, commentsExtended.xml, commentsIds.xml. Returns count removed."""
     count = 0
     for name in ['comments.xml', 'commentsExtended.xml', 'commentsIds.xml']:
@@ -582,12 +633,12 @@ def remove_comment_files(unpack_dir):
     return count
 
 
-def strip_comment_refs(doc):
+def strip_comment_refs(doc: str) -> str:
     """Strip comment range/reference tags from document XML string."""
     return re.sub(r'<w:(?:commentRangeStart|commentRangeEnd|commentReference)\b[^>]*/>', '', doc)
 
 
-def _strip_nested_tag(doc, tag, replacement):
+def _strip_nested_tag(doc: str, tag: str, replacement: str) -> str:
     """Remove or unwrap all instances of a potentially nested XML tag.
     Processes innermost matches first to handle nesting correctly."""
     pattern = rf'<{tag}\b[^>]*>((?:(?!</?{tag}\b).)*?)</{tag}>'
@@ -597,7 +648,7 @@ def _strip_nested_tag(doc, tag, replacement):
             return doc
 
 
-def strip_revisions(doc, warnings):
+def strip_revisions(doc: str, warnings: list[str]) -> tuple[str, RevisionCounts]:
     """Accept all tracked changes by stripping revision markup from document XML string.
 
     Returns (doc, counts) where counts is a dict with keys 'deletions', 'insertions',
@@ -628,7 +679,7 @@ def strip_revisions(doc, warnings):
     return doc, counts
 
 
-def remove_garbage_parts(unpack_dir):
+def remove_garbage_parts(unpack_dir: str) -> list[str]:
     """Remove thumbnail, VBA macros, printer settings, ActiveX, custom XML data."""
     removed = []
 
@@ -670,7 +721,7 @@ def remove_garbage_parts(unpack_dir):
     return removed
 
 
-def clean_content_types(unpack_dir):
+def clean_content_types(unpack_dir: str) -> None:
     """Remove Content_Types entries that reference deleted parts."""
     ct_path = os.path.join(unpack_dir, '[Content_Types].xml')
     if not os.path.exists(ct_path):
@@ -684,7 +735,7 @@ def clean_content_types(unpack_dir):
         f.write(ct)
 
 
-def clean_relationships(unpack_dir):
+def clean_relationships(unpack_dir: str) -> None:
     """Remove .rels entries that reference deleted parts."""
     for rels_dir, _, files in os.walk(unpack_dir):
         for fname in files:
@@ -705,8 +756,16 @@ def clean_relationships(unpack_dir):
                     f.write(rels)
 
 
-def _interactive_reconvert(media_dir, emf_to_vsdx, conversions,
-                           tmp_dir, fmt, dpi, warnings, max_width=0):
+def _interactive_reconvert(
+    media_dir: str,
+    emf_to_vsdx: dict[str, str],
+    conversions: dict[str, str],
+    tmp_dir: str,
+    fmt: ImageFormat,
+    dpi: int,
+    warnings: list[str],
+    max_megapixels: int = 100,
+) -> None:
     """Show the top 5 largest converted images and let the user re-convert
     selected ones from the original .vsdx at a different quality."""
 
@@ -800,30 +859,28 @@ def _interactive_reconvert(media_dir, emf_to_vsdx, conversions,
         try:
             old_size = os.path.getsize(img_path)
             _render_pdf_to_image(pdf_path, img_path, fmt=fmt, dpi=dpi,
-                                 quality=new_quality, max_width=max_width)
+                                 quality=new_quality, max_megapixels=max_megapixels)
             new_size = os.path.getsize(img_path)
             print(f'    {fname}: {old_size // 1024} KB -> {new_size // 1024} KB')
         except Exception as e:
             warnings.append(f'Re-conversion failed for {fname}: {e}')
 
 
-def shrink_docx(src_path, dst_path, fmt='jpg', dpi=300, quality=95, max_width=2000,
-                interactive=False):
-    """Shrink and sanitize a Word document.
-
-    Returns a dict with:
-        original_size_mb, new_size_mb, reduction_mb, reduction_percent,
-        output_path, visio_converted (list), visio_removed (int),
-        images_compressed (list of (name, old_kb, new_kb)),
-        duplicates_removed (int), comments_removed (int),
-        bookmarks_removed (int), garbage_removed (list),
-        warnings (list of str)
-    """
-    result = {
-        'original_size_mb': 0,
-        'new_size_mb': 0,
-        'reduction_mb': 0,
-        'reduction_percent': 0,
+def shrink_docx(
+    src_path: str,
+    dst_path: str,
+    fmt: ImageFormat = 'jpg',
+    dpi: int = 300,
+    quality: int = 95,
+    max_megapixels: int = 100,
+    interactive: bool = False,
+) -> ShrinkResult:
+    """Shrink and sanitize a Word document. See `ShrinkResult` for the return shape."""
+    result: ShrinkResult = {
+        'original_size_mb': 0.0,
+        'new_size_mb': 0.0,
+        'reduction_mb': 0.0,
+        'reduction_percent': 0.0,
         'output_path': dst_path,
         'visio_converted': [],
         'visio_removed': 0,
@@ -833,6 +890,8 @@ def shrink_docx(src_path, dst_path, fmt='jpg', dpi=300, quality=95, max_width=20
         'bookmarks_removed': 0,
         'garbage_removed': [],
         'warnings': [],
+        'revisions_stripped': {'deletions': 0, 'insertions': 0, 'property_changes': 0},
+        'personal_info_stripped': {},
     }
     warnings = result['warnings']
 
@@ -884,7 +943,7 @@ def shrink_docx(src_path, dst_path, fmt='jpg', dpi=300, quality=95, max_width=20
         vsdx_paths = [p for p in emf_to_vsdx.values() if os.path.exists(p)]
         conversions = convert_vsdx_via_visio(vsdx_paths, tmp_dir, warnings,
                                               fmt=fmt, dpi=dpi, quality=quality,
-                                              max_width=max_width,
+                                              max_megapixels=max_megapixels,
                                               keep_pdfs=interactive)
 
         # Place converted images and update refs
@@ -989,7 +1048,7 @@ def shrink_docx(src_path, dst_path, fmt='jpg', dpi=300, quality=95, max_width=20
 
         # --- 5. Compress/resize oversized raster images ---
         skip_files = {f'{b}.{fmt}' for b in converted}
-        compressed = compress_media_images(media_dir, max_width=max_width,
+        compressed = compress_media_images(media_dir, max_megapixels=max_megapixels,
                                            quality=quality, skip_files=skip_files)
         result['images_compressed'] = compressed
 
@@ -1013,7 +1072,8 @@ def shrink_docx(src_path, dst_path, fmt='jpg', dpi=300, quality=95, max_width=20
         # --- 11. Interactive: show top 5 largest images, offer re-conversion ---
         if interactive and emf_to_vsdx:
             _interactive_reconvert(media_dir, emf_to_vsdx, conversions,
-                                   tmp_dir, fmt, dpi, warnings, max_width=max_width)
+                                   tmp_dir, fmt, dpi, warnings,
+                                   max_megapixels=max_megapixels)
 
         # --- 12. Repack (write to temp file first for atomicity) ---
         tmp_output = dst_path + '.tmp'

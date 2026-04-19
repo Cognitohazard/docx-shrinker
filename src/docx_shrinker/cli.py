@@ -5,7 +5,7 @@ import os
 import sys
 from importlib.metadata import version, PackageNotFoundError
 
-from .core import shrink_docx
+from .core import ShrinkResult, shrink_docx
 
 try:
     __version__ = version("docx-shrinker")
@@ -28,7 +28,7 @@ _TAG_LABELS = {
 }
 
 
-def _print_result(result):
+def _print_result(result: ShrinkResult) -> None:
     """Print a clean summary of what was done."""
     lines = []
 
@@ -86,13 +86,13 @@ def _print_result(result):
     print('\n'.join(lines))
 
 
-def _print_warnings(warnings):
+def _print_warnings(warnings: list[str]) -> None:
     """Print any warnings that occurred."""
     for w in warnings:
         print(f'  WARNING: {w}', file=sys.stderr)
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     """Main entry point for the CLI."""
     parser = argparse.ArgumentParser(
         prog='docx-shrinker',
@@ -101,7 +101,7 @@ def main() -> int:
   1. Convert embedded Visio .vsdx -> PDF (via Visio COM) -> JPG/PNG (via PyMuPDF)
      Falls back to keeping EMF previews when Visio is unavailable.
   2. Convert OLE/VML objects to DrawingML inline pictures
-  3. Compress/resize oversized raster images (--max-width)
+  3. Compress/resize oversized raster images (--max-megapixels)
   4. Deduplicate identical media files
   5. Strip personal info (author, company, manager, etc.)
   6. Remove comments, tracked changes, and revision history
@@ -116,18 +116,21 @@ def main() -> int:
     parser.add_argument('--format', choices=['jpg', 'png'], default='jpg',
                         help='Image format for converted Visio figures (default: jpg)')
     parser.add_argument('--dpi', type=int, default=300,
-                        help='Rasterization DPI (default: 300)')
+                        help='Effective DPI for rasterization (default: 300). '
+                             'Every page renders at this DPI unless the result '
+                             'would exceed --max-megapixels.')
     parser.add_argument('--quality', type=int, default=95,
                         help='JPG quality 1-100 (default: 95). PNG is always lossless.')
-    parser.add_argument('--max-width', type=int, default=2000,
-                        help='Max pixel width for non-Visio images (default: 2000). '
-                             '0 to disable resizing.')
+    parser.add_argument('--max-megapixels', type=int, default=100,
+                        help='Cap on output pixel count per image, in megapixels '
+                             '(default: 100). Images exceeding the cap are '
+                             'downscaled, preserving aspect ratio. 0 to disable.')
     parser.add_argument('-i', '--interactive', action='store_true',
                         help='After conversion, show top 5 largest images and '
                              'offer to re-convert at different quality.')
     parser.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     src = args.input
     if args.output:
@@ -139,7 +142,8 @@ def main() -> int:
     try:
         print(f'Shrinking: {src}')
         result = shrink_docx(src, dst, fmt=args.format, dpi=args.dpi,
-                             quality=args.quality, max_width=args.max_width,
+                             quality=args.quality,
+                             max_megapixels=args.max_megapixels,
                              interactive=args.interactive)
         _print_warnings(result['warnings'])
         _print_result(result)
