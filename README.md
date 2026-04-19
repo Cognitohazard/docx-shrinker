@@ -52,7 +52,7 @@ docx-shrinker report.docx output.docx
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--format {jpg,png}` | `jpg` | Image format for converted Visio figures |
+| `--format {jpg,png}` | `png` | Image format for converted Visio figures |
 | `--dpi N` | `300` | Effective rasterization DPI. Every figure renders at this DPI unless the result would exceed `--max-megapixels`. |
 | `--quality N` | `95` | JPG quality (1–100). Ignored for PNG. |
 | `--max-megapixels N` | `100` | Cap on output pixel count per image, in megapixels. Images exceeding the cap are downscaled, preserving aspect ratio. `0` to disable. |
@@ -61,10 +61,10 @@ docx-shrinker report.docx output.docx
 
 ### Examples
 
-Convert Visio figures to PNG at 150 DPI:
+Convert Visio figures to JPG at 150 DPI:
 
 ```
-docx-shrinker report.docx --format png --dpi 150
+docx-shrinker report.docx --format jpg --dpi 150
 ```
 
 Aggressive compression (lower quality, tighter megapixel cap):
@@ -84,7 +84,7 @@ docx-shrinker report.docx -i
 ```python
 from docx_shrinker import shrink_docx
 
-result = shrink_docx("input.docx", "output.docx", fmt="jpg", dpi=300, quality=95)
+result = shrink_docx("input.docx", "output.docx", fmt="png", dpi=300, quality=95)
 
 print(f"{result['original_size_mb']} MB -> {result['new_size_mb']} MB")
 print(f"Reduction: {result['reduction_percent']}%")

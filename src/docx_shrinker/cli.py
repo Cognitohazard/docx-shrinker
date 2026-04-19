@@ -113,8 +113,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('input', help='Input .docx file')
     parser.add_argument('output', nargs='?', default=None,
                         help='Output .docx file (default: "input (shrunk).docx")')
-    parser.add_argument('--format', choices=['jpg', 'png'], default='jpg',
-                        help='Image format for converted Visio figures (default: jpg)')
+    parser.add_argument('--format', choices=['jpg', 'png'], default='png',
+                        help='Image format for converted Visio figures (default: png)')
     parser.add_argument('--dpi', type=int, default=300,
                         help='Effective DPI for rasterization (default: 300). '
                              'Every page renders at this DPI unless the result '

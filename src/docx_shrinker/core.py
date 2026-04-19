@@ -461,7 +461,7 @@ def _restore_pdf_images(pdf_path: str, vsdx_path: str, tmp_dir: str) -> None:
 def _render_pdf_to_image(
     pdf_path: str,
     img_path: str,
-    fmt: ImageFormat = 'jpg',
+    fmt: ImageFormat = 'png',
     dpi: int = 300,
     quality: int = 95,
     max_megapixels: int = 100,
@@ -528,7 +528,7 @@ def convert_vsdx_via_visio(
     vsdx_paths: list[str],
     out_dir: str,
     warnings: list[str],
-    fmt: ImageFormat = 'jpg',
+    fmt: ImageFormat = 'png',
     dpi: int = 300,
     quality: int = 95,
     max_megapixels: int = 100,
@@ -869,7 +869,7 @@ def _interactive_reconvert(
 def shrink_docx(
     src_path: str,
     dst_path: str,
-    fmt: ImageFormat = 'jpg',
+    fmt: ImageFormat = 'png',
     dpi: int = 300,
     quality: int = 95,
     max_megapixels: int = 100,
