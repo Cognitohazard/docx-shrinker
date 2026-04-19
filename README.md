@@ -139,6 +139,11 @@ Embedded Visio diagrams are OLE objects containing both the full `.vsdx` source 
 
 4. **`_render_pdf_to_image`** — Rasterizes the first page of the corrected PDF to PNG/JPG via PyMuPDF, using the computed clip rect. Renders at the requested effective DPI and downscales only if the result would exceed `max_megapixels`, so small and large Visio pages get the same quality.
 
+   Alternatives that failed:
+   - **SVG embedding via `<asvg:svgBlip>`** — The DrawingML spec supports embedding SVG alongside a raster fallback, and modern Word preserves SVG as vector through PDF export. But Visio COM's `Page.Export("*.svg")` produces SVG files that render as **all-black** shapes (stroke definitions survive, but fills, text styles, and images are lost or mis-referenced). There is no COM option to fix this. Since the SVG is unusable, the approach reduces to the raster pipeline anyway.
+   - **Post-hoc PDF figure replacement** — Let Word export docx → PDF as usual, then replace the Visio-sourced raster images in the output PDF with vector content from the intermediate Visio PDFs. Matching the raster placements in Word's PDF back to their source figures is unreliable: Word re-encodes JPGs (defeating hash match), changes pixel dimensions (defeating dim match), and can reorder or reflow figures (defeating document-order match). Even when matching works, the "vector" Visio PDFs are mostly raster anyway because Visio's PDF export rasterizes complex shapes — see `_restore_pdf_images` for the partial recovery we already do.
+   - **Higher DPI is the practical answer.** 300 DPI effective (the default) is sharp at normal reading zoom; 600 DPI is crisp up to 400% zoom. The megapixel cap (`max_megapixels`, default 100) keeps file sizes bounded when individual Visio pages are unusually large.
+
 #### 2. OLE/VML to DrawingML conversion
 
 - **`extract_vml_dimensions`** — Parses width/height in EMU from `<w:object>` style attributes (handles both `pt` and `in` units).
