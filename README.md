@@ -18,9 +18,7 @@ Shrink and sanitize Word (.docx) documents. Converts embedded Visio diagrams to 
 ## Requirements
 
 - **Python 3.10+**
-- **PyMuPDF** (`pymupdf`) — image compression and PDF-to-image rendering
-- **pywin32** — Visio COM automation (Windows only; Visio conversion is skipped if unavailable)
-- **Microsoft Visio** (optional) — required only for converting embedded `.vsdx` to high-quality images
+- **Microsoft Visio** (optional) — required only for converting embedded `.vsdx` to high-quality images. Without it, Visio diagrams fall back to their low-resolution EMF previews.
 
 ## Installation
 
