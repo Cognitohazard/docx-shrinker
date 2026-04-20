@@ -356,6 +356,103 @@ def _extract_vsdx_images(vsdx_path: str) -> list[tuple[str, bytes]]:
     return images
 
 
+def _vsdx_page_context(vsdx_path: str) -> tuple[int, set[str] | None]:
+    """Return (export_index, allowed_media_names) for a .vsdx.
+
+    export_index is the 0-based position of Visio's active page among
+    foreground pages — matching the PDF page order produced by
+    ExportAsFixedFormat with visPrintAll. allowed_media_names is the set
+    of image basenames the active page references (used to restrict
+    cross-page matching in _restore_pdf_images), or None when the set
+    cannot be determined (caller should use all media).
+
+    Falls back to (0, None) on any parse failure, preserving the
+    pre-existing behaviour of rendering the first exported page with
+    no source-image filtering.
+    """
+    try:
+        with zipfile.ZipFile(vsdx_path) as zf:
+            names = zf.namelist()
+            if 'visio/pages/pages.xml' not in names:
+                return 0, None
+            pages_xml = zf.read('visio/pages/pages.xml').decode('utf-8')
+            windows_xml = (zf.read('visio/windows.xml').decode('utf-8')
+                           if 'visio/windows.xml' in names else '')
+
+            foreground_ids: list[int] = []
+            for m in re.finditer(r'<Page\b[^>]*>', pages_xml):
+                tag = m.group(0)
+                if re.search(r'\bBackground="1"', tag):
+                    continue
+                id_m = re.search(r'\bID="(\d+)"', tag)
+                if id_m:
+                    foreground_ids.append(int(id_m.group(1)))
+            if not foreground_ids:
+                return 0, None
+
+            active_id: int | None = None
+            for m in re.finditer(r'<Window\b[^>]*>', windows_xml):
+                tag = m.group(0)
+                if 'WindowType="Drawing"' not in tag:
+                    continue
+                p_m = re.search(r'\bPage="(\d+)"', tag)
+                if p_m:
+                    active_id = int(p_m.group(1))
+                    break
+            if active_id is None:
+                return 0, None
+            try:
+                index = foreground_ids.index(active_id)
+            except ValueError:
+                return 0, None
+
+            page_block = re.search(
+                rf'<Page\b[^>]*\bID="{active_id}"[^>]*>.*?</Page>',
+                pages_xml, re.DOTALL,
+            )
+            if not page_block:
+                return index, None
+            rel_m = re.search(r'<Rel\b[^>]*r:id="(rId\d+)"', page_block.group(0))
+            if not rel_m:
+                return index, None
+            rid = rel_m.group(1)
+
+            pages_rels_name = 'visio/pages/_rels/pages.xml.rels'
+            if pages_rels_name not in names:
+                return index, None
+            pages_rels = zf.read(pages_rels_name).decode('utf-8')
+            t_m = re.search(
+                rf'<Relationship\b[^>]*\bId="{rid}"[^>]*\bTarget="([^"]*)"',
+                pages_rels,
+            )
+            if not t_m:
+                return index, None
+            page_rels_name = f'visio/pages/_rels/{os.path.basename(t_m.group(1))}.rels'
+            if page_rels_name not in names:
+                return index, set()
+            page_rels = zf.read(page_rels_name).decode('utf-8')
+            allowed: set[str] = set()
+            for m in re.finditer(r'<Relationship\b[^>]*\bTarget="([^"]*)"', page_rels):
+                target = m.group(1)
+                if '/media/' in target or target.startswith('media/'):
+                    allowed.add(os.path.basename(target))
+            return index, allowed
+    except (zipfile.BadZipFile, OSError):
+        return 0, None
+
+
+def _tmp_vsdx_base(vsdx_path: str) -> str:
+    """Stable unique filename stem for tmp files derived from a .vsdx path.
+
+    Two .vsdx files with identical basenames in different directories
+    get distinct stems so their intermediate PDFs/images do not clobber
+    each other in the shared tmp directory.
+    """
+    base = os.path.splitext(os.path.basename(vsdx_path))[0]
+    h = hashlib.md5(vsdx_path.encode('utf-8')).hexdigest()[:8]
+    return f'{base}_{h}'
+
+
 def _flip_pixmap_vertical(pix: fitz.Pixmap) -> fitz.Pixmap:
     """Return a new vertically-flipped copy of a PyMuPDF Pixmap."""
     w, h, n = pix.width, pix.height, pix.n
@@ -367,15 +464,30 @@ def _flip_pixmap_vertical(pix: fitz.Pixmap) -> fitz.Pixmap:
     return flipped
 
 
-def _restore_pdf_images(pdf_path: str, vsdx_path: str, tmp_dir: str) -> None:
+def _restore_pdf_images(
+    pdf_path: str,
+    vsdx_path: str,
+    tmp_dir: str,
+    page_index: int = 0,
+    allowed_names: set[str] | None = None,
+) -> None:
     """Replace Visio-degraded images in a PDF with originals from the vsdx.
 
     Visio downscales and JPEG-compresses raster images during PDF export.
     This extracts the originals from the vsdx ZIP, matches them to PDF
     images by aspect ratio, flips if the PDF transform has negative Y scale,
-    and replaces them.  Saves the fixed PDF back to pdf_path.
+    and replaces them. Saves the fixed PDF back to pdf_path.
+
+    allowed_names, when set, restricts source candidates to that set of
+    image basenames — preventing cross-page matches on .vsdx files where
+    multiple pages contain similarly-shaped images.
     """
+    if allowed_names is not None and not allowed_names:
+        return
     raw_originals = _extract_vsdx_images(vsdx_path)
+    if allowed_names is not None:
+        raw_originals = [(n, e, d) for n, e, d in raw_originals
+                         if os.path.basename(n) in allowed_names]
     if not raw_originals:
         return
 
@@ -392,7 +504,8 @@ def _restore_pdf_images(pdf_path: str, vsdx_path: str, tmp_dir: str) -> None:
         return
 
     pdf_doc = fitz.open(pdf_path)
-    page = pdf_doc[0]
+    idx = page_index if 0 <= page_index < len(pdf_doc) else 0
+    page = pdf_doc[idx]
     pdf_images = page.get_images(full=True)
     if not pdf_images:
         pdf_doc.close()
@@ -467,8 +580,9 @@ def _render_pdf_to_image(
     dpi: int = 300,
     quality: int = 95,
     max_megapixels: int = 100,
+    page_index: int = 0,
 ) -> bool:
-    """Render the first page of a PDF to an image file via PyMuPDF.
+    """Render one page of a PDF to an image file via PyMuPDF.
     Clips out the Visio page frame border before rasterizing.
 
     `dpi` is the effective render DPI. The output is downscaled only if it
@@ -476,9 +590,12 @@ def _render_pdf_to_image(
     requested DPI regardless of physical page size. `max_megapixels=0` disables
     the cap.
 
+    page_index selects the page (0-based). Out-of-range values fall back to 0.
+
     Returns True on success."""
     pdf_doc = fitz.open(pdf_path)
-    page = pdf_doc[0]
+    idx = page_index if 0 <= page_index < len(pdf_doc) else 0
+    page = pdf_doc[idx]
     scale = dpi / 72
 
     clip = _border_clip_rect(page)
@@ -546,17 +663,21 @@ def convert_vsdx_via_visio(
 
     try:
         for vsdx_path in vsdx_paths:
-            base = os.path.splitext(os.path.basename(vsdx_path))[0]
-            pdf_path = os.path.join(out_dir, f'{base}.pdf')
-            img_path = os.path.join(out_dir, f'{base}.{fmt}')
+            stem = _tmp_vsdx_base(vsdx_path)
+            pdf_path = os.path.join(out_dir, f'{stem}.pdf')
+            img_path = os.path.join(out_dir, f'{stem}.{fmt}')
             try:
                 _export_vsdx_to_pdf(visio, vsdx_path, pdf_path)
 
                 if os.path.exists(pdf_path):
-                    _restore_pdf_images(pdf_path, vsdx_path, out_dir)
+                    page_index, allowed_names = _vsdx_page_context(vsdx_path)
+                    _restore_pdf_images(pdf_path, vsdx_path, out_dir,
+                                        page_index=page_index,
+                                        allowed_names=allowed_names)
                     _render_pdf_to_image(pdf_path, img_path, fmt=fmt,
                                          dpi=dpi, quality=quality,
-                                         max_megapixels=max_megapixels)
+                                         max_megapixels=max_megapixels,
+                                         page_index=page_index)
 
                     if not keep_pdfs:
                         try:
@@ -567,6 +688,7 @@ def convert_vsdx_via_visio(
                 if os.path.exists(img_path):
                     results[vsdx_path] = img_path
             except Exception as e:
+                base = os.path.splitext(os.path.basename(vsdx_path))[0]
                 warnings.append(f'Visio failed on {base}.vsdx: {e}')
                 for p in [pdf_path, img_path]:
                     if os.path.exists(p):
@@ -828,8 +950,8 @@ def _interactive_reconvert(
     needs_reexport = []
     for idx in sorted(selected):
         fname, _, vsdx_path = top5[idx]
-        base = os.path.splitext(os.path.basename(vsdx_path))[0]
-        pdf_path = os.path.join(tmp_dir, f'{base}.pdf')
+        stem = _tmp_vsdx_base(vsdx_path)
+        pdf_path = os.path.join(tmp_dir, f'{stem}.pdf')
         if not os.path.exists(pdf_path) and os.path.exists(vsdx_path):
             needs_reexport.append((idx, vsdx_path, pdf_path))
 
@@ -854,17 +976,21 @@ def _interactive_reconvert(
     for idx in sorted(selected):
         fname, _, vsdx_path = top5[idx]
         img_path = os.path.join(media_dir, fname)
-        base = os.path.splitext(os.path.basename(vsdx_path))[0]
-        pdf_path = os.path.join(tmp_dir, f'{base}.pdf')
+        stem = _tmp_vsdx_base(vsdx_path)
+        pdf_path = os.path.join(tmp_dir, f'{stem}.pdf')
 
         if not os.path.exists(pdf_path):
+            base = os.path.splitext(os.path.basename(vsdx_path))[0]
             warnings.append(f'PDF not available for {base}, skipping')
             continue
 
         try:
+            page_index, _ = _vsdx_page_context(vsdx_path)
             old_size = os.path.getsize(img_path)
             _render_pdf_to_image(pdf_path, img_path, fmt=fmt, dpi=dpi,
-                                 quality=new_quality, max_megapixels=max_megapixels)
+                                 quality=new_quality,
+                                 max_megapixels=max_megapixels,
+                                 page_index=page_index)
             new_size = os.path.getsize(img_path)
             print(f'    {fname}: {old_size // 1024} KB -> {new_size // 1024} KB')
         except Exception as e:
@@ -946,6 +1072,13 @@ def shrink_docx(
             if ole_target.endswith('.vsdx') and img_target:
                 emf_name = os.path.basename(img_target)
                 vsdx_path = os.path.join(unpack_dir, 'word', ole_target.replace('/', os.sep))
+                prior = emf_to_vsdx.get(emf_name)
+                if prior is not None and prior != vsdx_path:
+                    warnings.append(
+                        f'EMF preview {emf_name} is shared by multiple Visio '
+                        f'embeddings with different .vsdx sources; the later '
+                        f'one will win, which may show the wrong diagram'
+                    )
                 emf_to_vsdx[emf_name] = vsdx_path
                 visio_obj_spans.add(obj_m.span())
 

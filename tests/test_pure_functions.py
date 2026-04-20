@@ -4,6 +4,8 @@ Each test targets a distinct code path, branch, or edge case.
 No two tests exercise the same logic with interchangeable data.
 """
 
+import zipfile
+
 import pytest
 from docx_shrinker.core import (
     extract_vml_dimensions,
@@ -15,6 +17,9 @@ from docx_shrinker.core import (
     strip_revisions,
     _find_page_border,
     _border_clip_rect,
+    _vsdx_page_context,
+    _tmp_vsdx_base,
+    _render_pdf_to_image,
 )
 
 
@@ -398,3 +403,190 @@ class TestBorderClipRect:
         clip = _border_clip_rect(page)
         assert clip == page.rect
         doc.close()
+
+
+# ---------------------------------------------------------------------------
+# _vsdx_page_context
+# ---------------------------------------------------------------------------
+
+def _make_vsdx(tmp_path, pages_xml, windows_xml=None,
+               pages_rels_xml=None, page_rels=None):
+    """Build a minimal .vsdx ZIP for testing.
+
+    page_rels: optional dict {page_filename: rels_xml} for per-page rels.
+    """
+    p = tmp_path / 't.vsdx'
+    with zipfile.ZipFile(p, 'w') as zf:
+        zf.writestr('visio/pages/pages.xml', pages_xml)
+        if windows_xml is not None:
+            zf.writestr('visio/windows.xml', windows_xml)
+        if pages_rels_xml is not None:
+            zf.writestr('visio/pages/_rels/pages.xml.rels', pages_rels_xml)
+        if page_rels:
+            for name, xml in page_rels.items():
+                zf.writestr(f'visio/pages/_rels/{name}.rels', xml)
+    return str(p)
+
+
+class TestVsdxPageContext:
+    def test_missing_pages_xml_returns_fallback(self, tmp_path):
+        p = tmp_path / 'bad.vsdx'
+        with zipfile.ZipFile(p, 'w') as zf:
+            zf.writestr('other.xml', '<x/>')
+        assert _vsdx_page_context(str(p)) == (0, None)
+
+    def test_no_windows_xml_returns_fallback(self, tmp_path):
+        p = _make_vsdx(tmp_path,
+                       '<Pages><Page ID="0"/><Page ID="1"/></Pages>')
+        assert _vsdx_page_context(p) == (0, None)
+
+    def test_active_middle_page_without_rels(self, tmp_path):
+        """Active page can be located, but no rels → index but no filter."""
+        p = _make_vsdx(
+            tmp_path,
+            '<Pages><Page ID="0"/><Page ID="5"/><Page ID="9"/></Pages>',
+            windows_xml='<Windows><Window WindowType="Drawing" Page="5"/></Windows>',
+        )
+        assert _vsdx_page_context(p) == (1, None)
+
+    def test_background_pages_excluded_from_index(self, tmp_path):
+        """Background pages are not exported by visPrintAll, so they must not
+        count toward the page index."""
+        p = _make_vsdx(
+            tmp_path,
+            '<Pages>'
+            '<Page ID="0" Background="1"/>'
+            '<Page ID="5"/>'
+            '<Page ID="9"/>'
+            '</Pages>',
+            windows_xml='<Windows><Window WindowType="Drawing" Page="9"/></Windows>',
+        )
+        # ID=9 is the 2nd foreground page => index 1
+        assert _vsdx_page_context(p) == (1, None)
+
+    def test_active_id_not_in_foreground_falls_back(self, tmp_path):
+        p = _make_vsdx(
+            tmp_path,
+            '<Pages><Page ID="0"/><Page ID="5"/></Pages>',
+            windows_xml='<Windows><Window WindowType="Drawing" Page="99"/></Windows>',
+        )
+        assert _vsdx_page_context(p) == (0, None)
+
+    def test_non_drawing_window_ignored(self, tmp_path):
+        p = _make_vsdx(
+            tmp_path,
+            '<Pages><Page ID="0"/><Page ID="5"/></Pages>',
+            windows_xml='<Windows>'
+                        '<Window WindowType="ShapeSheet" Page="5"/>'
+                        '</Windows>',
+        )
+        assert _vsdx_page_context(p) == (0, None)
+
+    def test_corrupt_zip_returns_fallback(self, tmp_path):
+        p = tmp_path / 'corrupt.vsdx'
+        p.write_bytes(b'not a zip')
+        assert _vsdx_page_context(str(p)) == (0, None)
+
+    def test_returns_active_page_media_basenames(self, tmp_path):
+        p = _make_vsdx(
+            tmp_path,
+            '<Pages>'
+            '<Page ID="0"><Rel r:id="rId1"/></Page>'
+            '<Page ID="5"><Rel r:id="rId2"/></Page>'
+            '</Pages>',
+            windows_xml='<Windows><Window WindowType="Drawing" Page="5"/></Windows>',
+            pages_rels_xml='<Relationships>'
+                           '<Relationship Id="rId1" Target="page1.xml"/>'
+                           '<Relationship Id="rId2" Target="page2.xml"/>'
+                           '</Relationships>',
+            page_rels={'page2.xml':
+                '<Relationships>'
+                '<Relationship Id="rId1" Target="../media/image2.png"/>'
+                '<Relationship Id="rId2" Target="../media/image3.jpg"/>'
+                '</Relationships>'},
+        )
+        assert _vsdx_page_context(p) == (1, {'image2.png', 'image3.jpg'})
+
+    def test_active_page_with_no_rels_returns_empty_set(self, tmp_path):
+        """An active page whose rels file is missing has zero source images —
+        callers can short-circuit."""
+        p = _make_vsdx(
+            tmp_path,
+            '<Pages><Page ID="0"><Rel r:id="rId1"/></Page></Pages>',
+            windows_xml='<Windows><Window WindowType="Drawing" Page="0"/></Windows>',
+            pages_rels_xml='<Relationships>'
+                           '<Relationship Id="rId1" Target="page1.xml"/>'
+                           '</Relationships>',
+        )
+        assert _vsdx_page_context(p) == (0, set())
+
+
+# ---------------------------------------------------------------------------
+# _tmp_vsdx_base
+# ---------------------------------------------------------------------------
+
+class TestTmpVsdxBase:
+    def test_includes_basename(self):
+        stem = _tmp_vsdx_base('/tmp/foo/Microsoft_Visio_Drawing.vsdx')
+        assert stem.startswith('Microsoft_Visio_Drawing_')
+
+    def test_different_paths_same_basename_get_distinct_stems(self):
+        """The same filename in different directories must not collide —
+        otherwise their rendered PDFs/PNGs overwrite each other in tmp."""
+        a = _tmp_vsdx_base('/tmp/dirA/drawing.vsdx')
+        b = _tmp_vsdx_base('/tmp/dirB/drawing.vsdx')
+        assert a != b
+
+    def test_same_path_deterministic(self):
+        """Same path must produce the same stem across calls so interactive
+        re-render can locate the PDF the initial conversion wrote."""
+        path = '/tmp/x/drawing.vsdx'
+        assert _tmp_vsdx_base(path) == _tmp_vsdx_base(path)
+
+
+# ---------------------------------------------------------------------------
+# _render_pdf_to_image page_index parameter
+# ---------------------------------------------------------------------------
+
+class TestRenderPdfPageIndex:
+    def _make_multipage_pdf(self, tmp_path):
+        import fitz
+        pdf_path = str(tmp_path / 't.pdf')
+        doc = fitz.open()
+        doc.new_page(width=100, height=100)
+        doc.new_page(width=200, height=150)
+        doc.new_page(width=400, height=300)
+        doc.save(pdf_path)
+        doc.close()
+        return pdf_path
+
+    def test_renders_requested_page(self, tmp_path):
+        import fitz
+        pdf_path = self._make_multipage_pdf(tmp_path)
+        img_path = str(tmp_path / 'out.png')
+        _render_pdf_to_image(pdf_path, img_path, fmt='png', dpi=72,
+                             page_index=1)
+        pix = fitz.Pixmap(img_path)
+        # Page 1 is 200x150 at 72 dpi (scale=1) and no border to clip
+        assert pix.width == 200
+        assert pix.height == 150
+
+    def test_default_page_index_renders_first_page(self, tmp_path):
+        import fitz
+        pdf_path = self._make_multipage_pdf(tmp_path)
+        img_path = str(tmp_path / 'out.png')
+        _render_pdf_to_image(pdf_path, img_path, fmt='png', dpi=72)
+        pix = fitz.Pixmap(img_path)
+        assert pix.width == 100
+        assert pix.height == 100
+
+    def test_out_of_range_page_index_falls_back_to_first(self, tmp_path):
+        """A stale or mismatched index must not crash — fall back to page 0."""
+        import fitz
+        pdf_path = self._make_multipage_pdf(tmp_path)
+        img_path = str(tmp_path / 'out.png')
+        _render_pdf_to_image(pdf_path, img_path, fmt='png', dpi=72,
+                             page_index=99)
+        pix = fitz.Pixmap(img_path)
+        assert pix.width == 100
+        assert pix.height == 100
