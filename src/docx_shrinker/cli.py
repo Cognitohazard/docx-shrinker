@@ -100,6 +100,7 @@ def main(argv: list[str] | None = None) -> int:
         epilog='''steps performed:
   1. Convert embedded Visio .vsdx -> PDF (via Visio COM) -> JPG/PNG (via PyMuPDF)
      Falls back to keeping EMF previews when Visio is unavailable.
+     Skipped entirely when --skip-visio is passed (embeddings preserved).
   2. Convert OLE/VML objects to DrawingML inline pictures
   3. Compress/resize oversized raster images (--max-megapixels)
   4. Deduplicate identical media files
@@ -128,6 +129,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('-i', '--interactive', action='store_true',
                         help='After conversion, show top 5 largest images and '
                              'offer to re-convert at different quality.')
+    parser.add_argument('--skip-visio', action='store_true',
+                        help='Leave embedded Visio .vsdx files and their OLE '
+                             'wrappers untouched so diagrams remain editable.')
     parser.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
 
     args = parser.parse_args(argv)
@@ -144,7 +148,8 @@ def main(argv: list[str] | None = None) -> int:
         result = shrink_docx(src, dst, fmt=args.format, dpi=args.dpi,
                              quality=args.quality,
                              max_megapixels=args.max_megapixels,
-                             interactive=args.interactive)
+                             interactive=args.interactive,
+                             skip_visio=args.skip_visio)
         _print_warnings(result['warnings'])
         _print_result(result)
         print(f'Saved: {dst}')

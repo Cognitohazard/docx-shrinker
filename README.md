@@ -4,7 +4,7 @@ Shrink and sanitize Word (.docx) documents. Converts embedded Visio diagrams to 
 
 ## What it does
 
-1. **Convert Visio embeddings** — `.vsdx` → PDF (via Visio COM) → JPG/PNG (via PyMuPDF). Falls back to keeping the EMF preview when Visio is unavailable.
+1. **Convert Visio embeddings** — `.vsdx` → PDF (via Visio COM) → JPG/PNG (via PyMuPDF). Falls back to keeping the EMF preview when Visio is unavailable. Skipped entirely with `--skip-visio`, which preserves the original `.vsdx` files so diagrams stay editable.
 2. **Convert OLE objects** — Replaces legacy VML `<w:object>` blocks with modern DrawingML `<w:drawing>` inline pictures.
 3. **Compress images** — Resizes raster images exceeding a pixel width threshold and re-compresses JPGs.
 4. **Deduplicate media** — Identifies identical files by hash and rewrites relationships to point to a single copy.
@@ -57,6 +57,7 @@ docx-shrinker report.docx output.docx
 | `--quality N` | `95` | JPG quality (1–100). Ignored for PNG. |
 | `--max-megapixels N` | `100` | Cap on output pixel count per image, in megapixels. Images exceeding the cap are downscaled, preserving aspect ratio. `0` to disable. |
 | `-i, --interactive` | off | After conversion, show top 5 largest images and offer to re-convert at different quality |
+| `--skip-visio` | off | Leave embedded `.vsdx` files and their OLE wrappers untouched so diagrams remain editable in Visio. All other shrinking steps still run. |
 | `--version` | | Show version and exit |
 
 ### Examples
@@ -79,6 +80,12 @@ Interactive mode to fine-tune large images:
 docx-shrinker report.docx -i
 ```
 
+Keep Visio diagrams editable (skips the `.vsdx` → raster pass):
+
+```
+docx-shrinker report.docx --skip-visio
+```
+
 ### Python API
 
 ```python
@@ -89,6 +96,8 @@ result = shrink_docx("input.docx", "output.docx", fmt="png", dpi=300, quality=95
 print(f"{result['original_size_mb']} MB -> {result['new_size_mb']} MB")
 print(f"Reduction: {result['reduction_percent']}%")
 ```
+
+Pass `skip_visio=True` to preserve embedded `.vsdx` files and their OLE wrappers.
 
 The `result` dict contains:
 

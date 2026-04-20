@@ -49,12 +49,14 @@ def _downscale_factor(total_px: float, cap_megapixels: int) -> float:
 
 
 # Patterns for parts removed during cleanup (used in content types and rels)
+_VISIO_CLEANUP_PATTERN = r'embeddings/[^"]*\.vsdx'
 _CLEANUP_PATTERNS = [
     r'vbaProject\.bin', r'comments\.xml', r'commentsExtended\.xml',
     r'commentsIds\.xml', r'thumbnail\.\w+', r'vbaData\.xml',
     r'printerSettings/', r'activeX/', r'customXml/', r'custom\.xml',
-    r'embeddings/[^"]*\.vsdx',
+    _VISIO_CLEANUP_PATTERN,
 ]
+_CLEANUP_PATTERNS_KEEP_VISIO = [p for p in _CLEANUP_PATTERNS if p != _VISIO_CLEANUP_PATTERN]
 
 
 def extract_vml_dimensions(obj_xml: str) -> tuple[int, int]:
@@ -735,8 +737,11 @@ def clean_content_types(unpack_dir: str) -> None:
         f.write(ct)
 
 
-def clean_relationships(unpack_dir: str) -> None:
-    """Remove .rels entries that reference deleted parts."""
+def clean_relationships(unpack_dir: str, skip_visio: bool = False) -> None:
+    """Remove .rels entries that reference deleted parts.
+
+    When skip_visio is True, Visio .vsdx rels are preserved."""
+    patterns = _CLEANUP_PATTERNS_KEEP_VISIO if skip_visio else _CLEANUP_PATTERNS
     for rels_dir, _, files in os.walk(unpack_dir):
         for fname in files:
             if not fname.endswith('.rels'):
@@ -745,7 +750,7 @@ def clean_relationships(unpack_dir: str) -> None:
             with open(rels_path, 'r', encoding='utf-8') as f:
                 rels = f.read()
             changed = False
-            for pattern in _CLEANUP_PATTERNS:
+            for pattern in patterns:
                 for tag_re in [rf'<Relationship\b[^>]*Target="[^"]*{pattern}[^"]*"[^>]*/>',
                                rf'<Relationship\b[^>]*Target="[^"]*{pattern}[^"]*"[^>]*>.*?</Relationship>']:
                     rels, n = re.subn(tag_re, '', rels, flags=re.DOTALL)
@@ -874,8 +879,11 @@ def shrink_docx(
     quality: int = 95,
     max_megapixels: int = 100,
     interactive: bool = False,
+    skip_visio: bool = False,
 ) -> ShrinkResult:
-    """Shrink and sanitize a Word document. See `ShrinkResult` for the return shape."""
+    """Shrink and sanitize a Word document. See `ShrinkResult` for the return shape.
+
+    When skip_visio is True, .vsdx embeddings are preserved."""
     result: ShrinkResult = {
         'original_size_mb': 0.0,
         'new_size_mb': 0.0,
@@ -925,7 +933,8 @@ def shrink_docx(
             rid_to_target[m.group(1)] = m.group(2)
 
         # Find each <w:object> and extract OLE rId (-> .vsdx) and image rId (-> .emf)
-        emf_to_vsdx = {}  # {emf_filename: vsdx_full_path}
+        emf_to_vsdx: dict[str, str] = {}
+        visio_obj_spans: set[tuple[int, int]] = set()
         for obj_m in re.finditer(r'<w:object\b[^>]*>.*?</w:object>', doc, flags=re.DOTALL):
             obj_xml = obj_m.group(0)
             ole_match = re.search(r'<o:OLEObject\b[^>]*r:id="(rId\d+)"', obj_xml)
@@ -938,55 +947,60 @@ def shrink_docx(
                 emf_name = os.path.basename(img_target)
                 vsdx_path = os.path.join(unpack_dir, 'word', ole_target.replace('/', os.sep))
                 emf_to_vsdx[emf_name] = vsdx_path
+                visio_obj_spans.add(obj_m.span())
 
         # Convert via Visio COM (batch — opens Visio once for all files)
-        vsdx_paths = [p for p in emf_to_vsdx.values() if os.path.exists(p)]
-        conversions = convert_vsdx_via_visio(vsdx_paths, tmp_dir, warnings,
-                                              fmt=fmt, dpi=dpi, quality=quality,
-                                              max_megapixels=max_megapixels,
-                                              keep_pdfs=interactive)
+        conversions: dict[str, str] = {}
+        converted: list[str] = []
+        if not skip_visio:
+            vsdx_paths = [p for p in emf_to_vsdx.values() if os.path.exists(p)]
+            conversions = convert_vsdx_via_visio(vsdx_paths, tmp_dir, warnings,
+                                                  fmt=fmt, dpi=dpi, quality=quality,
+                                                  max_megapixels=max_megapixels,
+                                                  keep_pdfs=interactive)
 
-        # Place converted images and update refs
-        converted = []  # list of emf_basename_no_ext
-        for emf_name, vsdx_path in emf_to_vsdx.items():
-            img_path = conversions.get(vsdx_path)
-            if img_path is None:
-                continue
+            # Place converted images and update refs
+            for emf_name, vsdx_path in emf_to_vsdx.items():
+                img_path = conversions.get(vsdx_path)
+                if img_path is None:
+                    continue
 
-            emf_base = os.path.splitext(emf_name)[0]
-            dest = os.path.join(media_dir, f'{emf_base}.{fmt}')
-            shutil.copy2(img_path, dest)
+                emf_base = os.path.splitext(emf_name)[0]
+                dest = os.path.join(media_dir, f'{emf_base}.{fmt}')
+                shutil.copy2(img_path, dest)
 
-            # Remove the old EMF
-            emf_path = os.path.join(media_dir, emf_name)
-            if os.path.exists(emf_path):
-                os.remove(emf_path)
+                # Remove the old EMF
+                emf_path = os.path.join(media_dir, emf_name)
+                if os.path.exists(emf_path):
+                    os.remove(emf_path)
 
-            converted.append(emf_base)
-            size_kb = os.path.getsize(dest) // 1024
-            result['visio_converted'].append((emf_base, size_kb))
+                converted.append(emf_base)
+                size_kb = os.path.getsize(dest) // 1024
+                result['visio_converted'].append((emf_base, size_kb))
 
-        if emf_to_vsdx and not converted:
-            warnings.append(f'Kept {len(emf_to_vsdx)} EMF preview(s) (Visio unavailable)')
+            if emf_to_vsdx and not converted:
+                warnings.append(f'Kept {len(emf_to_vsdx)} EMF preview(s) (Visio unavailable)')
 
-        # Delete all .vsdx files (whether conversion succeeded or not)
-        vsdx_removed = 0
-        if os.path.isdir(embed_dir):
-            remaining = []
-            for f in os.listdir(embed_dir):
-                if f.endswith('.vsdx'):
-                    os.remove(os.path.join(embed_dir, f))
-                    vsdx_removed += 1
-                else:
-                    remaining.append(f)
-            if not remaining:
-                os.rmdir(embed_dir)
-        result['visio_removed'] = vsdx_removed
+            # Delete all .vsdx files (whether conversion succeeded or not)
+            vsdx_removed = 0
+            if os.path.isdir(embed_dir):
+                remaining = []
+                for f in os.listdir(embed_dir):
+                    if f.endswith('.vsdx'):
+                        os.remove(os.path.join(embed_dir, f))
+                        vsdx_removed += 1
+                    else:
+                        remaining.append(f)
+                if not remaining:
+                    os.rmdir(embed_dir)
+            result['visio_removed'] = vsdx_removed
 
         # --- 2. Convert OLE objects to DrawingML ---
         _id_counter = [next_doc_pr_id(doc)]
 
         def _replace_object(m):
+            if skip_visio and m.span() in visio_obj_spans:
+                return m.group(0)
             r = object_to_drawing(m.group(0), _id_counter[0])
             _id_counter[0] += 1
             return r
@@ -1013,7 +1027,8 @@ def shrink_docx(
             rels = rels_xml
 
             # Remove Visio embedding relationships
-            rels = re.sub(r'<Relationship[^>]*Target="embeddings/[^"]*\.vsdx"[^/]*/>', '', rels)
+            if not skip_visio:
+                rels = re.sub(r'<Relationship[^>]*Target="embeddings/[^"]*\.vsdx"[^/]*/>', '', rels)
 
             # Update converted image refs: .emf -> new format
             for emf_base in converted:
@@ -1027,7 +1042,8 @@ def shrink_docx(
         with open(ct_path, 'r', encoding='utf-8') as f:
             ct = f.read()
 
-        ct = re.sub(r'<Override[^>]*\.vsdx[^>]*/>', '', ct)
+        if not skip_visio:
+            ct = re.sub(r'<Override[^>]*\.vsdx[^>]*/>', '', ct)
         # Remove stale Default entries for formats no longer present
         has_emf = os.path.isdir(media_dir) and any(f.endswith('.emf') for f in os.listdir(media_dir))
         if not has_emf:
@@ -1067,10 +1083,10 @@ def shrink_docx(
 
         # --- 10. Clean up references to deleted parts ---
         clean_content_types(unpack_dir)
-        clean_relationships(unpack_dir)
+        clean_relationships(unpack_dir, skip_visio=skip_visio)
 
         # --- 11. Interactive: show top 5 largest images, offer re-conversion ---
-        if interactive and emf_to_vsdx:
+        if interactive and emf_to_vsdx and not skip_visio:
             _interactive_reconvert(media_dir, emf_to_vsdx, conversions,
                                    tmp_dir, fmt, dpi, warnings,
                                    max_megapixels=max_megapixels)
